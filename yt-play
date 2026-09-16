@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# yt-play - audio-only YouTube playback via mpv + yt-dlp, with auto-reconnect
+# on stream drops and station names pulled from a config file you can extend.
+set -euo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/yt-play"
+CONFIG_FILE="$CONFIG_DIR/stations.conf"
+SENTINEL="/tmp/.yt-play-sentinel"
+STATE_FILE="/tmp/.yt-play-now-playing"
+
+usage() {
+  cat <<EOF
+yt-play - audio-only YouTube playback
+
+Usage:
+  yt-play <name>     Play a station from $CONFIG_FILE
+  yt-play <url>      Play any YouTube URL, audio only
+  yt-play stop       Stop playback
+  yt-play status     Show what's playing
+
+Requires: mpv, yt-dlp, pkill/pgrep (procps - preinstalled on
+virtually every Linux distro and macOS). Optional: mpv-mpris (Linux
+only) puts mpv on MPRIS so playerctl and your desktop's media keys
+can play/pause it, same as Spotify or a browser tab. No socket, no
+extra subcommand.
+
+Stations and cookies_browser are edited in $CONFIG_FILE
+(created on first run).
+EOF
+}
+
+ensure_config() {
+  [[ -f "$CONFIG_FILE" ]] && return
+  mkdir -p "$CONFIG_DIR"
+  cat >"$CONFIG_FILE" <<'EOF'
+# yt-play stations - one per line: name=youtube-url
+# `yt-play <name>` plays it. Add your own below.
+lofi=https://www.youtube.com/watch?v=rFZHOHl-L8A
+synth=https://www.youtube.com/watch?v=4xDzrJKXOOY
+
+# Browser to pull YouTube cookies from - strongly recommended for live
+# stations above, which otherwise get HTTP 403'd after a few minutes on
+# YouTube's anonymous client. Uncomment and set to yours.
+#cookies_browser=firefox
+EOF
+}
+
+lookup_config() {
+  local name="$1"
+  grep -m1 "^${name}=" "$CONFIG_FILE" 2>/dev/null | cut -d= -f2-
+}
+
+check_deps() {
+  command -v mpv >/dev/null || { echo "yt-play: mpv not found (see README for install)" >&2; exit 1; }
+  command -v yt-dlp >/dev/null || { echo "yt-play: yt-dlp not found (see README for install)" >&2; exit 1; }
+  if [[ -z "${SYTMP_COOKIES_BROWSER:-}" ]]; then
+    echo "yt-play: no cookies_browser set in $CONFIG_FILE - live stations will likely 403 after a few minutes" >&2
+  fi
+}
+
+stop() {
+  rm -f "$SENTINEL" "$STATE_FILE"
+  pkill -f 'mpv --no-video' 2>/dev/null && echo "Stopped." || echo "Nothing playing."
+}
+
+play() {
+  local url="$1"
+  check_deps
+  stop &>/dev/null
+
+  local ytdl_opts="extractor-retries=infinite,fragment-retries=infinite,retry-sleep=3"
+  if [[ -n "${SYTMP_COOKIES_BROWSER:-}" ]]; then
+    ytdl_opts="cookies-from-browser=${SYTMP_COOKIES_BROWSER},${ytdl_opts}"
+  fi
+
+  touch "$SENTINEL"
+  echo "$url" >"$STATE_FILE"
+  (
+    while [[ -f "$SENTINEL" ]]; do
+      mpv --no-video \
+        --cache=yes \
+        --demuxer-max-bytes=150MiB \
+        --demuxer-max-back-bytes=75MiB \
+        --network-timeout=10 \
+        --stream-lavf-o=reconnect=1:reconnect_streamed=1:reconnect_delay_max=5 \
+        --ytdl-raw-options="$ytdl_opts" \
+        "$url" &>/dev/null
+      # mpv exited - either `yt-play stop` removed the sentinel (deliberate)
+      # or the stream dropped (crash/network death). Re-check the sentinel
+      # and, if it's still there, restart after a short backoff instead of
+      # going silent.
+      [[ -f "$SENTINEL" ]] || break
+      sleep 2
+    done
+  ) &>/dev/null &
+  disown
+  echo "Playing: $url"
+}
+
+status() {
+  if [[ -f "$STATE_FILE" ]] && pgrep -f 'mpv --no-video' >/dev/null; then
+    echo "Playing: $(cat "$STATE_FILE")"
+  else
+    echo "Nothing playing."
+  fi
+}
+
+ensure_config
+
+: "${SYTMP_COOKIES_BROWSER:=$(lookup_config cookies_browser)}"
+
+arg="${1:-}"
+
+case "$arg" in
+  "" | -h | --help) usage ;;
+  stop) stop ;;
+  status) status ;;
+  cookies_browser)
+    echo "yt-play: 'cookies_browser' is a config setting, not a station" >&2
+    exit 1
+    ;;
+  http*) play "$arg" ;;
+  *)
+    station_url="$(lookup_config "$arg")"
+    if [[ -n "$station_url" ]]; then
+      play "$station_url"
+    else
+      echo "yt-play: unknown station or argument '$arg'" >&2
+      echo "Edit $CONFIG_FILE to add stations, or pass a URL directly." >&2
+      exit 1
+    fi
+    ;;
+esac
