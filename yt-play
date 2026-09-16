@@ -65,6 +65,7 @@ stop() {
 
 play() {
   local url="$1"
+  local label="${2:-$1}"
   check_deps
   stop &>/dev/null
 
@@ -74,7 +75,7 @@ play() {
   fi
 
   touch "$SENTINEL"
-  echo "$url" >"$STATE_FILE"
+  printf '%s\n%s\n' "$label" "$url" >"$STATE_FILE"
   (
     while [[ -f "$SENTINEL" ]]; do
       mpv --no-video \
@@ -94,12 +95,18 @@ play() {
     done
   ) &>/dev/null &
   disown
-  echo "Playing: $url"
+  echo "Playing: $label"
 }
 
 status() {
   if [[ -f "$STATE_FILE" ]] && pgrep -f 'mpv --no-video' >/dev/null; then
-    echo "Playing: $(cat "$STATE_FILE")"
+    local label url
+    { read -r label; read -r url; } <"$STATE_FILE"
+    if [[ "$label" == "$url" ]]; then
+      echo "Playing: $url"
+    else
+      echo "Playing: $label ($url)"
+    fi
   else
     echo "Nothing playing."
   fi
@@ -123,7 +130,7 @@ case "$arg" in
   *)
     station_url="$(lookup_config "$arg")"
     if [[ -n "$station_url" ]]; then
-      play "$station_url"
+      play "$station_url" "$arg"
     else
       echo "yt-play: unknown station or argument '$arg'" >&2
       echo "Edit $CONFIG_FILE to add stations, or pass a URL directly." >&2
