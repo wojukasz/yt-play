@@ -7,6 +7,7 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/yt-play"
 CONFIG_FILE="$CONFIG_DIR/stations.conf"
 SENTINEL="/tmp/.yt-play-sentinel"
 STATE_FILE="/tmp/.yt-play-now-playing"
+LOG_FILE="/tmp/.yt-play-log"
 
 usage() {
   cat <<EOF
@@ -47,7 +48,7 @@ EOF
 
 lookup_config() {
   local name="$1"
-  grep -m1 "^${name}=" "$CONFIG_FILE" 2>/dev/null | cut -d= -f2-
+  grep -m1 "^${name}=" "$CONFIG_FILE" 2>/dev/null | cut -d= -f2- || true
 }
 
 check_deps() {
@@ -59,7 +60,7 @@ check_deps() {
 }
 
 stop() {
-  rm -f "$SENTINEL" "$STATE_FILE"
+  rm -f "$SENTINEL" "$STATE_FILE" "$LOG_FILE"
   pkill -f 'mpv --no-video' 2>/dev/null && echo "Stopped." || echo "Nothing playing."
 }
 
@@ -76,26 +77,44 @@ play() {
 
   touch "$SENTINEL"
   printf '%s\n%s\n' "$label" "$url" >"$STATE_FILE"
+  : >"$LOG_FILE"
   (
     while [[ -f "$SENTINEL" ]]; do
+      start=$(date +%s)
       mpv --no-video \
         --cache=yes \
         --demuxer-max-bytes=150MiB \
         --demuxer-max-back-bytes=75MiB \
         --network-timeout=10 \
-        --stream-lavf-o=reconnect=1:reconnect_streamed=1:reconnect_delay_max=5 \
+        --stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=5 \
         --ytdl-raw-options="$ytdl_opts" \
-        "$url" &>/dev/null
+        "$url" >"$LOG_FILE" 2>&1
       # mpv exited - either `yt-play stop` removed the sentinel (deliberate)
       # or the stream dropped (crash/network death). Re-check the sentinel
       # and, if it's still there, restart after a short backoff instead of
       # going silent.
       [[ -f "$SENTINEL" ]] || break
+      if (( $(date +%s) - start < 5 )); then
+        # died almost instantly - a real failure (bad url, extractor error,
+        # missing cookies), not a network drop. Stop instead of looping
+        # forever with no sound and no error.
+        rm -f "$SENTINEL"
+        break
+      fi
       sleep 2
     done
   ) &>/dev/null &
   disown
-  echo "Playing: $label"
+
+  sleep 1.5
+  if pgrep -f 'mpv --no-video' >/dev/null; then
+    echo "Playing: $label"
+  else
+    echo "yt-play: failed to start '$label'" >&2
+    tail -n 5 "$LOG_FILE" >&2
+    rm -f "$STATE_FILE"
+    exit 1
+  fi
 }
 
 status() {
